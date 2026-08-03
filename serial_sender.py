@@ -16,8 +16,6 @@ class SerialSender:
 
     def open(self, port: str, baudrate: int = BAUDRATE) -> None:
         self.ser = serial.Serial(port, baudrate, bytesize=8, parity='N', stopbits=1, timeout=1)
-        if not self.ser.is_open and hasattr(self.ser, 'open'):
-            self.ser.open()
         self._logger.info(f'串口已打开: {port} @ {baudrate}')
 
     def close(self) -> None:
@@ -37,6 +35,9 @@ class SerialSender:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f'文件不存在: {file_path}')
 
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError('发送正在进行中')
+
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._send_loop,
@@ -44,7 +45,6 @@ class SerialSender:
             daemon=True,
         )
         self._thread.start()
-        self._thread.join()
 
     def _send_loop(self, file_path: str, on_progress, on_log) -> None:
         total_size = os.path.getsize(file_path)
@@ -53,9 +53,11 @@ class SerialSender:
         if on_log:
             on_log(f'开始发送: {file_path} ({total_size} bytes)')
 
+        stopped = False
         with open(file_path, 'rb') as f:
             while True:
                 if self._stop_event.is_set():
+                    stopped = True
                     self._logger.info('发送被用户停止')
                     if on_log:
                         on_log('发送已停止')
@@ -77,9 +79,10 @@ class SerialSender:
                 if len(chunk) == FRAME_SIZE:
                     time.sleep(INTERVAL_MS / 1000.0)
 
-        self._logger.info(f'发送完成: {sent_bytes}/{total_size} bytes')
-        if on_log:
-            on_log(f'发送完成: {sent_bytes}/{total_size} bytes')
+        if not stopped:
+            self._logger.info(f'发送完成: {sent_bytes}/{total_size} bytes')
+            if on_log:
+                on_log(f'发送完成: {sent_bytes}/{total_size} bytes')
 
     def stop(self) -> None:
         self._stop_event.set()

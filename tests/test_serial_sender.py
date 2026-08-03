@@ -8,7 +8,7 @@ from config import FRAME_SIZE, FRAME_TOTAL_SIZE
 
 class FakeSerial:
     def __init__(self):
-        self.is_open = False
+        self.is_open = True
         self.written = b''
 
     def open(self):
@@ -47,9 +47,8 @@ def test_send_bin_progress(tmp_path, monkeypatch):
     progress = MagicMock()
     log = MagicMock()
 
-    thread = threading.Thread(target=sender.send_bin, args=(str(bin_file), progress, log))
-    thread.start()
-    thread.join(timeout=5)
+    sender.send_bin(str(bin_file), progress, log)
+    sender._thread.join(timeout=5)
 
     sender.close()
 
