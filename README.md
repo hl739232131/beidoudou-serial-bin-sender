@@ -24,6 +24,8 @@ python main.py
 
 ## 打包成 exe
 
+需在 **Windows** 环境下执行（PyInstaller 在目标平台上打包）：
+
 ```bash
 python build.py
 ```
