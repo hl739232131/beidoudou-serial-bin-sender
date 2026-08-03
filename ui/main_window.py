@@ -1,11 +1,10 @@
 import os
-import sys
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QLineEdit, QFileDialog, QProgressBar, QTextEdit,
     QMessageBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from serial_sender import SerialSender
 from config import BAUDRATE
 
@@ -13,16 +12,19 @@ from config import BAUDRATE
 class MainWindow(QWidget):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
+    finished_signal = pyqtSignal(bool, str)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle('串口 BIN 发送上位机')
         self.resize(600, 450)
-        self.sender = SerialSender()
+        self._sender = SerialSender()
         self.bin_path = ''
+        self._user_stopped = False
 
         self.log_signal.connect(self.append_log)
         self.progress_signal.connect(self.update_progress)
+        self.finished_signal.connect(self.on_send_finished)
 
         self._init_ui()
         self.refresh_ports()
@@ -90,23 +92,30 @@ class MainWindow(QWidget):
         import serial.tools.list_ports
         self.port_combo.clear()
         ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port_combo.addItems(ports)
+        for device in ports:
+            # 真实串口把设备名存进 userData，占位项的 userData 为 None
+            self.port_combo.addItem(device, device)
         if not ports:
-            self.port_combo.addItem('未找到串口')
+            self.port_combo.addItem('未找到串口', None)
+
+    def selected_port(self):
+        return self.port_combo.currentData()
 
     def toggle_port(self):
-        if self.sender.is_open():
-            self.sender.close()
+        if self._sender.is_open():
+            self._sender.close()
             self.open_btn.setText('打开串口')
+            self.send_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             self.log('串口已关闭')
         else:
-            port = self.port_combo.currentText()
-            if not port or port == '未找到串口':
+            port = self.selected_port()
+            if not port:
                 QMessageBox.warning(self, '警告', '请先选择有效串口')
                 return
             try:
                 baud = int(self.baud_combo.currentText())
-                self.sender.open(port, baud)
+                self._sender.open(port, baud)
                 self.open_btn.setText('关闭串口')
                 self.log(f'串口已打开: {port} @ {baud}')
             except Exception as e:
@@ -120,22 +129,24 @@ class MainWindow(QWidget):
             self.log(f'已选择文件: {path}')
 
     def start_send(self):
-        if not self.sender.is_open():
+        if not self._sender.is_open():
             QMessageBox.warning(self, '警告', '请先打开串口')
             return
         if not self.bin_path or not os.path.exists(self.bin_path):
             QMessageBox.warning(self, '警告', '请选择有效的 bin 文件')
             return
 
+        self._user_stopped = False
         self.send_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.progress.setValue(0)
 
         try:
-            self.sender.send_bin(
+            self._sender.send_bin(
                 self.bin_path,
                 on_progress=lambda c, t: self.progress_signal.emit(c, t),
                 on_log=lambda msg: self.log_signal.emit(msg),
+                on_finished=lambda ok, msg: self.finished_signal.emit(ok, msg),
             )
         except Exception as e:
             QMessageBox.critical(self, '错误', f'发送失败: {e}')
@@ -143,16 +154,22 @@ class MainWindow(QWidget):
             self.stop_btn.setEnabled(False)
 
     def stop_send(self):
-        self.sender.stop()
-        self.send_btn.setEnabled(True)
+        self._user_stopped = True
         self.stop_btn.setEnabled(False)
+        # stop() 不阻塞；按钮状态由 on_send_finished 恢复
+        self._sender.stop()
 
     def update_progress(self, current, total):
         if total > 0:
             self.progress.setValue(int(current * 100 / total))
-        if current >= total:
-            self.send_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
+
+    def on_send_finished(self, success, message):
+        self.send_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.append_log(message)
+        if not success and not self._user_stopped:
+            QMessageBox.critical(self, '错误', message)
+        self._user_stopped = False
 
     def append_log(self, msg):
         self.log_box.append(msg)
@@ -161,5 +178,5 @@ class MainWindow(QWidget):
         self.append_log(msg)
 
     def closeEvent(self, event):
-        self.sender.close()
+        self._sender.close()
         event.accept()
