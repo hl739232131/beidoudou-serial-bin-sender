@@ -1,0 +1,10 @@
+import os
+
+FRAME_HEADER = b'\xAA\x55'
+FRAME_SIZE = 128
+CRC_SIZE = 4
+FRAME_TOTAL_SIZE = 2 + FRAME_SIZE + CRC_SIZE
+BAUDRATE = 115200
+INTERVAL_MS = 50
+DEFAULT_LOG_LEVEL = 'INFO'
+LOG_FILE = os.path.join('logs', 'serial-bin-sender.log')
