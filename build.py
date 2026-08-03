@@ -17,6 +17,17 @@ def main():
         '--name', 'SerialBinSender',
         '--noconfirm',
         '--clean',
+        # PyQt6 子模块：显式收集，避免 Windows 打包后运行时找不到模块
+        '--hidden-import', 'PyQt6',
+        '--hidden-import', 'PyQt6.sip',
+        '--hidden-import', 'PyQt6.QtCore',
+        '--hidden-import', 'PyQt6.QtGui',
+        '--hidden-import', 'PyQt6.QtWidgets',
+        # pyserial 在 ui/main_window.py 中动态导入
+        '--hidden-import', 'serial.tools.list_ports',
+        # 收集 PyQt6 与 pyserial 的全部资源/子模块，确保 Qt 插件和平台文件完整
+        '--collect-all', 'PyQt6',
+        '--collect-all', 'pyserial',
         'main.py',
     ]
     print('Running:', ' '.join(cmd))
