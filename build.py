@@ -21,7 +21,11 @@ def main():
     ]
     print('Running:', ' '.join(cmd))
     subprocess.check_call(cmd, cwd=project_dir)
-    print('Build complete. Output: dist/SerialBinSender.exe')
+
+    output = 'dist/SerialBinSender.exe' if sys.platform == 'win32' else 'dist/SerialBinSender'
+    print(f'Build complete. Output: {os.path.join(project_dir, output)}')
+    if sys.platform != 'win32':
+        print('提示: 该产物只能在当前平台运行，Windows .exe 需在 Windows 上重新打包。')
 
 
 if __name__ == '__main__':
