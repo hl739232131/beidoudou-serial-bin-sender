@@ -1,3 +1,4 @@
+import logging
 import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -5,22 +6,24 @@ from PyQt6.QtWidgets import (
     QMessageBox
 )
 from PyQt6.QtCore import pyqtSignal
-from serial_sender import SerialSender
+from serial_sender import SerialSender, SendResult
 from config import BAUDRATE
+from logger import get_logger, get_log_file_path
 
 
 class MainWindow(QWidget):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
-    finished_signal = pyqtSignal(bool, str)
+    # SendResult 不是 Qt 已知类型，用 object 传递
+    finished_signal = pyqtSignal(object, str)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle('串口 BIN 发送上位机')
         self.resize(600, 450)
+        self._logger = get_logger(__name__)
         self._sender = SerialSender()
         self.bin_path = ''
-        self._user_stopped = False
 
         self.log_signal.connect(self.append_log)
         self.progress_signal.connect(self.update_progress)
@@ -28,6 +31,7 @@ class MainWindow(QWidget):
 
         self._init_ui()
         self.refresh_ports()
+        self._log_startup_info()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -88,6 +92,21 @@ class MainWindow(QWidget):
         self.log_box.setReadOnly(True)
         layout.addWidget(self.log_box)
 
+    def _log_startup_info(self):
+        log_path = get_log_file_path()
+        if log_path:
+            self.log(f'日志文件: {log_path}')
+        else:
+            self.log('未找到可写的日志目录，日志仅保留在本窗口')
+
+    def _set_sending_ui(self, sending: bool):
+        """发送期间锁定会影响发送的控件；关闭串口仍然允许，用于中断发送。"""
+        self.send_btn.setEnabled(not sending)
+        self.stop_btn.setEnabled(sending)
+        self.select_file_btn.setEnabled(not sending)
+        self.refresh_btn.setEnabled(not sending)
+        self.baud_combo.setEnabled(not sending)
+
     def refresh_ports(self):
         import serial.tools.list_ports
         self.port_combo.clear()
@@ -103,14 +122,15 @@ class MainWindow(QWidget):
 
     def toggle_port(self):
         if self._sender.is_open():
+            # close() 会请求停止发送，发送线程随后以 STOPPED 上报，不弹错误框
             self._sender.close()
             self.open_btn.setText('打开串口')
-            self.send_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
+            self._set_sending_ui(False)
             self.log('串口已关闭')
         else:
             port = self.selected_port()
             if not port:
+                self.log('打开串口失败: 未选择有效串口', logging.WARNING)
                 QMessageBox.warning(self, '警告', '请先选择有效串口')
                 return
             try:
@@ -119,6 +139,7 @@ class MainWindow(QWidget):
                 self.open_btn.setText('关闭串口')
                 self.log(f'串口已打开: {port} @ {baud}')
             except Exception as e:
+                self.log(f'打开串口失败: {e}', logging.ERROR, exc_info=True)
                 QMessageBox.critical(self, '错误', f'打开串口失败: {e}')
 
     def select_file(self):
@@ -130,15 +151,15 @@ class MainWindow(QWidget):
 
     def start_send(self):
         if not self._sender.is_open():
+            self.log('发送失败: 串口未打开', logging.WARNING)
             QMessageBox.warning(self, '警告', '请先打开串口')
             return
         if not self.bin_path or not os.path.exists(self.bin_path):
+            self.log(f'发送失败: bin 文件无效 ({self.bin_path or "未选择"})', logging.WARNING)
             QMessageBox.warning(self, '警告', '请选择有效的 bin 文件')
             return
 
-        self._user_stopped = False
-        self.send_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self._set_sending_ui(True)
         self.progress.setValue(0)
 
         try:
@@ -146,15 +167,14 @@ class MainWindow(QWidget):
                 self.bin_path,
                 on_progress=lambda c, t: self.progress_signal.emit(c, t),
                 on_log=lambda msg: self.log_signal.emit(msg),
-                on_finished=lambda ok, msg: self.finished_signal.emit(ok, msg),
+                on_finished=lambda result, msg: self.finished_signal.emit(result, msg),
             )
         except Exception as e:
+            self.log(f'发送失败: {e}', logging.ERROR, exc_info=True)
             QMessageBox.critical(self, '错误', f'发送失败: {e}')
-            self.send_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
+            self._set_sending_ui(False)
 
     def stop_send(self):
-        self._user_stopped = True
         self.stop_btn.setEnabled(False)
         # stop() 不阻塞；按钮状态由 on_send_finished 恢复
         self._sender.stop()
@@ -163,19 +183,19 @@ class MainWindow(QWidget):
         if total > 0:
             self.progress.setValue(int(current * 100 / total))
 
-    def on_send_finished(self, success, message):
-        self.send_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+    def on_send_finished(self, result, message):
+        self._set_sending_ui(False)
         self.append_log(message)
-        if not success and not self._user_stopped:
+        if result is SendResult.FAILED:
             QMessageBox.critical(self, '错误', message)
-        self._user_stopped = False
 
     def append_log(self, msg):
         self.log_box.append(msg)
 
-    def log(self, msg):
+    def log(self, msg, level=logging.INFO, exc_info=False):
+        """UI 日志框与日志文件同步记录，便于事后排查。"""
         self.append_log(msg)
+        self._logger.log(level, msg, exc_info=exc_info)
 
     def closeEvent(self, event):
         self._sender.close()
