@@ -31,6 +31,20 @@ def test_pack_frame_crc_is_correct():
     assert actual_crc == expected_crc
 
 
+def test_pack_frame_crc_known_answer():
+    """固定测试向量，确保 CRC 变体不被无意改成 CRC-32/BZIP2 等其它多项式。"""
+    # CRC-32/ISO-HDLC（zlib）对 b'123456789' 的标准校验值
+    assert binascii.crc32(b'123456789') & 0xFFFFFFFF == 0xCBF43926
+
+    frame = pack_frame(b'123456789')
+    assert frame == (
+        FRAME_HEADER
+        + b'123456789'
+        + b'\xFF' * (FRAME_SIZE - 9)
+        + bytes.fromhex('e9e7a1d4')  # 0xD4A1E7E9 小端
+    )
+
+
 def test_pack_frame_exceeds_size_raises():
     with pytest.raises(ValueError):
         pack_frame(b'X' * (FRAME_SIZE + 1))
