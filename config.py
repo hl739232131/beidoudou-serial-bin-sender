@@ -1,4 +1,5 @@
 import os
+import sys
 
 FRAME_HEADER = b'\xAA\x55'
 FRAME_SIZE = 128
@@ -6,5 +7,18 @@ CRC_SIZE = 4
 FRAME_TOTAL_SIZE = 2 + FRAME_SIZE + CRC_SIZE
 BAUDRATE = 115200
 INTERVAL_MS = 50
+READ_TIMEOUT_S = 1.0
+WRITE_TIMEOUT_S = 2.0
 DEFAULT_LOG_LEVEL = 'INFO'
-LOG_FILE = os.path.join('logs', 'serial-bin-sender.log')
+
+
+def _base_dir() -> str:
+    """打包成 exe 后以可执行文件所在目录为基准，否则以源码目录为基准。"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = _base_dir()
+LOG_DIR = os.path.join(BASE_DIR, 'logs')
+LOG_FILE = os.path.join(LOG_DIR, 'serial-bin-sender.log')
