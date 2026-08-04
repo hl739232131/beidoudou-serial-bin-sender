@@ -3,14 +3,34 @@ import sys
 import tempfile
 
 APP_NAME = 'SerialBinSender'
+
+# 帧格式：帧头 + 字节数(2) + 命令(1) + 数据(N) + CRC32(4)
+# 字节数 = 命令(1) + 数据(N) + CRC32(4)
 FRAME_HEADER = b'\xAA\x55'
-FRAME_SIZE = 128
+LENGTH_SIZE = 2
+CMD_SIZE = 1
 CRC_SIZE = 4
-FRAME_TOTAL_SIZE = 2 + FRAME_SIZE + CRC_SIZE
+HEADER_SIZE = len(FRAME_HEADER)
+
+# 串口参数
 BAUDRATE = 115200
-INTERVAL_MS = 50
 READ_TIMEOUT_S = 1.0
 WRITE_TIMEOUT_S = 2.0
+
+# 主机命令
+CMD_A5 = 0xA5  # 主机申请下发字节数 N
+CMD_5A = 0x5A  # 从机回复收到
+CMD_A7 = 0xA7  # 主机申请第 x 个 bin 数据包
+CMD_7A = 0x7A  # 从机发送第 x 个 bin 数据包
+
+# 5A 回复状态
+A5_ACK_OK = 0xA5   # N 正常，已收到
+A5_ACK_ERR = 0x00  # N 异常（>512 或 ==0）
+
+# N 的范围：0 < N < 513
+MIN_PACKET_SIZE = 1
+MAX_PACKET_SIZE = 512
+
 DEFAULT_LOG_LEVEL = 'INFO'
 
 

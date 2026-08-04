@@ -1,50 +1,94 @@
 import struct
 import binascii
 import pytest
-from protocol import pack_frame
-from config import FRAME_HEADER, FRAME_SIZE, FRAME_TOTAL_SIZE
+from protocol import (
+    calc_crc, pack_frame, parse_frame,
+    pack_a5_request, pack_5a_ack, pack_a7_request, pack_7a_response,
+    parse_a5_data, parse_a7_data, parse_7a_data,
+)
+from config import FRAME_HEADER, HEADER_SIZE, LENGTH_SIZE, CMD_SIZE, CRC_SIZE
+from config import CMD_A5, CMD_5A, CMD_A7, CMD_7A, A5_ACK_OK
 
 
-def test_pack_frame_full_length():
-    data = b'A' * FRAME_SIZE
-    frame = pack_frame(data)
-    assert len(frame) == FRAME_TOTAL_SIZE
-    assert frame[:2] == FRAME_HEADER
-    assert frame[2:2 + FRAME_SIZE] == data
+def test_calc_crc_matches_binascii():
+    data = b'123456789'
+    assert calc_crc(data) == binascii.crc32(data) & 0xFFFFFFFF
 
 
-def test_pack_frame_short_data_padded():
-    data = b'hello'
-    frame = pack_frame(data)
-    assert len(frame) == FRAME_TOTAL_SIZE
-    payload = frame[2:2 + FRAME_SIZE]
-    assert payload[:5] == data
-    assert payload[5:] == b'\xFF' * (FRAME_SIZE - 5)
+def test_pack_frame_basic():
+    cmd = CMD_A5
+    data = struct.pack('<H', 128)
+    length = CMD_SIZE + len(data) + CRC_SIZE
+    frame = pack_frame(length, cmd, data)
 
+    assert frame[:HEADER_SIZE] == FRAME_HEADER
+    assert struct.unpack('<H', frame[HEADER_SIZE:HEADER_SIZE + LENGTH_SIZE])[0] == length
+    assert frame[HEADER_SIZE + LENGTH_SIZE] == cmd
+    assert frame[HEADER_SIZE + LENGTH_SIZE + 1:HEADER_SIZE + LENGTH_SIZE + 1 + len(data)] == data
 
-def test_pack_frame_crc_is_correct():
-    data = b'\x01\x02\x03\x04'
-    frame = pack_frame(data)
-    payload = frame[2:2 + FRAME_SIZE]
-    expected_crc = binascii.crc32(payload) & 0xFFFFFFFF
-    actual_crc = struct.unpack('<I', frame[2 + FRAME_SIZE:])[0]
+    body_for_crc = frame[HEADER_SIZE:HEADER_SIZE + LENGTH_SIZE + length - CRC_SIZE]
+    expected_crc = binascii.crc32(body_for_crc) & 0xFFFFFFFF
+    actual_crc = struct.unpack('<I', frame[-CRC_SIZE:])[0]
     assert actual_crc == expected_crc
 
 
-def test_pack_frame_crc_known_answer():
-    """固定测试向量，确保 CRC 变体不被无意改成 CRC-32/BZIP2 等其它多项式。"""
-    # CRC-32/ISO-HDLC（zlib）对 b'123456789' 的标准校验值
-    assert binascii.crc32(b'123456789') & 0xFFFFFFFF == 0xCBF43926
-
-    frame = pack_frame(b'123456789')
-    assert frame == (
-        FRAME_HEADER
-        + b'123456789'
-        + b'\xFF' * (FRAME_SIZE - 9)
-        + bytes.fromhex('e9e7a1d4')  # 0xD4A1E7E9 小端
-    )
+def test_parse_frame_roundtrip():
+    x = 0x12345678
+    frame = pack_a7_request(x)
+    length, cmd, parsed_data = parse_frame(frame)
+    assert length == CMD_SIZE + 4 + CRC_SIZE
+    assert cmd == CMD_A7
+    assert parse_a7_data(parsed_data) == x
 
 
-def test_pack_frame_exceeds_size_raises():
-    with pytest.raises(ValueError):
-        pack_frame(b'X' * (FRAME_SIZE + 1))
+def test_parse_frame_crc_error():
+    frame = bytearray(pack_a5_request(128))
+    frame[-1] ^= 0xFF  # 破坏 CRC
+    with pytest.raises(ValueError, match='CRC32'):
+        parse_frame(bytes(frame))
+
+
+def test_parse_frame_bad_header():
+    frame = b'\x00\x00' + pack_a5_request(128)[2:]
+    with pytest.raises(ValueError, match='帧头'):
+        parse_frame(frame)
+
+
+def test_a5_request_roundtrip():
+    frame = pack_a5_request(256)
+    _, cmd, data = parse_frame(frame)
+    assert cmd == CMD_A5
+    assert parse_a5_data(data) == 256
+
+
+def test_5a_ack_roundtrip():
+    frame = pack_5a_ack(A5_ACK_OK)
+    _, cmd, data = parse_frame(frame)
+    assert cmd == CMD_5A
+    assert data == bytes([A5_ACK_OK])
+
+
+def test_a7_request_roundtrip():
+    frame = pack_a7_request(1234)
+    _, cmd, data = parse_frame(frame)
+    assert cmd == CMD_A7
+    assert parse_a7_data(data) == 1234
+
+
+def test_7a_response_roundtrip():
+    payload = b'A' * 128
+    frame = pack_7a_response(42, payload)
+    _, cmd, data = parse_frame(frame)
+    assert cmd == CMD_7A
+    x, parsed_payload = parse_7a_data(data)
+    assert x == 42
+    assert parsed_payload == payload
+
+
+def test_7a_response_short_data():
+    frame = pack_7a_response(0, b'')
+    _, cmd, data = parse_frame(frame)
+    assert cmd == CMD_7A
+    x, parsed_payload = parse_7a_data(data)
+    assert x == 0
+    assert parsed_payload == b''
