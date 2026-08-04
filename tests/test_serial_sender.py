@@ -1,329 +1,174 @@
+import os
+import struct
 import threading
 import time
-import pytest
 import serial
 from unittest.mock import MagicMock
-from serial_sender import SerialSender, SendResult
-from protocol import pack_frame
-from config import BAUDRATE, FRAME_SIZE, FRAME_TOTAL_SIZE, INTERVAL_MS, WRITE_TIMEOUT_S
+import pytest
+from serial_sender import SerialSender
+from protocol import pack_a5_request, pack_a7_request
+from config import CMD_5A, CMD_7A, A5_ACK_OK, A5_ACK_ERR, MAX_PACKET_SIZE
 
 
 class FakeSerial:
-    def __init__(self, *args, **kwargs):
-        self.init_args = args
-        self.init_kwargs = kwargs
-        self.is_open = True
+    def __init__(self, to_read=b''):
+        self._to_read = to_read
+        self._read_idx = 0
         self.written = b''
-        self.cancel_write_calls = 0
-        self._lock = threading.Lock()
+        self._open = True
 
-    def open(self):
-        self.is_open = True
+    def read(self, size=1):
+        available = len(self._to_read) - self._read_idx
+        to_read = min(size, available)
+        data = self._to_read[self._read_idx:self._read_idx + to_read]
+        self._read_idx += to_read
+        return data
 
-    def cancel_write(self):
-        self.cancel_write_calls += 1
-
-    def close(self):
-        self.is_open = False
+    @property
+    def in_waiting(self):
+        return len(self._to_read) - self._read_idx
 
     def write(self, data):
-        with self._lock:
-            self.written += data
+        self.written += data
 
-    def isOpen(self):
-        return self.is_open
+    @property
+    def is_open(self):
+        return self._open
 
-
-def expected_bytes(payload: bytes) -> bytes:
-    frames = [
-        pack_frame(payload[i:i + FRAME_SIZE])
-        for i in range(0, len(payload), FRAME_SIZE)
-    ]
-    return b''.join(frames)
+    def close(self):
+        self._open = False
 
 
-def make_sender(monkeypatch, open_kwargs=None) -> tuple[SerialSender, FakeSerial]:
-    created = []
+def _wait_for_written(fake, min_bytes, timeout=2.0):
+    """等待 fake 收到至少 min_bytes 字节的回复。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if len(fake.written) >= min_bytes:
+            return True
+        time.sleep(0.05)
+    return False
 
-    def fake_serial(*args, **kwargs):
-        fake = FakeSerial(*args, **kwargs)
-        created.append(fake)
-        return fake
 
-    monkeypatch.setattr(serial, 'Serial', fake_serial)
+def test_open_close(monkeypatch):
+    fake = FakeSerial()
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
     sender = SerialSender()
-    sender.open('COM1', **(open_kwargs or {}))
-    return sender, created[0]
-
-
-def test_sender_open_close(monkeypatch):
-    sender, fake = make_sender(monkeypatch)
+    sender.open('COM1')
     assert sender.is_open()
-
-    # 串口线路参数属于协议约定，必须固定为 8N1
-    assert fake.init_args[0] == 'COM1'
-    assert fake.init_args[1] == BAUDRATE
-    assert fake.init_kwargs['bytesize'] == 8
-    assert fake.init_kwargs['parity'] == 'N'
-    assert fake.init_kwargs['stopbits'] == 1
-    assert fake.init_kwargs['write_timeout'] == WRITE_TIMEOUT_S
-
+    assert sender.is_listening()
     sender.close()
     assert not sender.is_open()
-    assert not fake.is_open
+    assert not sender.is_listening()
 
 
-def test_sender_open_honours_explicit_parameters(monkeypatch):
-    sender, fake = make_sender(
-        monkeypatch, {'baudrate': 9600, 'write_timeout': 0.5}
-    )
-    assert fake.init_args[1] == 9600
-    assert fake.init_kwargs['write_timeout'] == 0.5
-    sender.close()
-
-
-def test_send_bin_progress(tmp_path, monkeypatch):
-    sender, fake = make_sender(monkeypatch)
+def test_a5_valid_sets_packet_size(monkeypatch, tmp_path):
+    fake = FakeSerial(to_read=pack_a5_request(64))
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
 
     bin_file = tmp_path / 'test.bin'
-    payload = b'B' * (FRAME_SIZE * 2 + 10)
-    bin_file.write_bytes(payload)
+    bin_file.write_bytes(b'X' * 200)
 
-    progress = MagicMock()
-    log = MagicMock()
-    finished = MagicMock()
-
-    sender.send_bin(str(bin_file), progress, log, finished)
-    assert sender.wait(timeout=5)
-
-    sender.close()
-
-    expected = expected_bytes(payload)
-    assert len(expected) == 3 * FRAME_TOTAL_SIZE
-    assert fake.written == expected
-    progress.assert_called()
-    log.assert_called()
-    finished.assert_called_once()
-    result, message = finished.call_args[0]
-    assert result is SendResult.COMPLETED
-    assert '发送完成' in message
-
-
-def test_send_bin_empty_file_finishes(tmp_path, monkeypatch):
-    sender, fake = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'empty.bin'
-    bin_file.write_bytes(b'')
-
-    finished = MagicMock()
-    sender.send_bin(str(bin_file), None, None, finished)
-    assert sender.wait(timeout=5)
-    sender.close()
-
-    assert fake.written == b''
-    finished.assert_called_once_with(SendResult.COMPLETED, '发送完成: 0/0 bytes')
-
-
-def test_send_bin_requires_open_port(tmp_path):
     sender = SerialSender()
-    bin_file = tmp_path / 'test.bin'
-    bin_file.write_bytes(b'A' * FRAME_SIZE)
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
 
-    with pytest.raises(RuntimeError, match='串口未打开'):
-        sender.send_bin(str(bin_file))
-
-
-def test_send_bin_missing_file(tmp_path, monkeypatch):
-    sender, _ = make_sender(monkeypatch)
-    missing = tmp_path / 'nope.bin'
-
-    with pytest.raises(FileNotFoundError):
-        sender.send_bin(str(missing))
-
+    assert _wait_for_written(fake, 1)
     sender.close()
 
-
-def test_send_bin_rejects_overlap(tmp_path, monkeypatch):
-    sender, _ = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'large.bin'
-    bin_file.write_bytes(b'D' * FRAME_SIZE * 100)
-
-    sender.send_bin(str(bin_file))
-    try:
-        with pytest.raises(RuntimeError, match='发送正在进行中'):
-            sender.send_bin(str(bin_file))
-    finally:
-        sender.stop()
-        sender.wait(timeout=5)
-        sender.close()
+    # 第一个回复应该是 5A
+    assert fake.written[0:2] == b'\xAA\x55'
+    assert fake.written[4] == CMD_5A
+    assert fake.written[5] == A5_ACK_OK
 
 
-def test_write_error_reported_to_finished(tmp_path, monkeypatch):
-    sender, fake = make_sender(monkeypatch)
-
-    def boom(data):
-        raise serial.SerialTimeoutException('write timeout')
-
-    monkeypatch.setattr(fake, 'write', boom)
+def test_a5_invalid_replies_zero(monkeypatch, tmp_path):
+    fake = FakeSerial(to_read=pack_a5_request(600))
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
 
     bin_file = tmp_path / 'test.bin'
-    bin_file.write_bytes(b'E' * FRAME_SIZE)
+    bin_file.write_bytes(b'X' * 100)
 
-    finished = MagicMock()
-    sender.send_bin(str(bin_file), None, None, finished)
-    assert sender.wait(timeout=5)
-    sender.close()
-
-    finished.assert_called_once()
-    result, message = finished.call_args[0]
-    assert result is SendResult.FAILED
-    assert '发送超时' in message
-
-
-def test_stop_sending(tmp_path, monkeypatch):
-    sender, fake = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'large.bin'
-    bin_file.write_bytes(b'C' * FRAME_SIZE * 100)
-
-    finished = MagicMock()
-    sender.send_bin(str(bin_file), None, None, finished)
-    time.sleep(0.1)
-    sender.stop()
-    assert sender.wait(timeout=5)
-    sender.close()
-
-    assert len(fake.written) < FRAME_TOTAL_SIZE * 100
-    finished.assert_called_once()
-    result, message = finished.call_args[0]
-    assert result is SendResult.STOPPED
-    assert '发送已停止' in message
-
-
-def test_stop_does_not_block_caller(tmp_path, monkeypatch):
-    sender, _ = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'large.bin'
-    bin_file.write_bytes(b'F' * FRAME_SIZE * 100)
-
-    sender.send_bin(str(bin_file))
-    started = time.monotonic()
-    sender.stop()
-    assert time.monotonic() - started < 0.2
-
-    sender.wait(timeout=5)
-    sender.close()
-
-
-def test_stop_cancels_pending_write(tmp_path, monkeypatch):
-    sender, fake = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'large.bin'
-    bin_file.write_bytes(b'G' * FRAME_SIZE * 100)
-
-    sender.send_bin(str(bin_file))
-    sender.stop()
-    assert sender.wait(timeout=5)
-    sender.close()
-
-    assert fake.cancel_write_calls >= 1
-
-
-def test_close_during_send_reports_stopped(tmp_path, monkeypatch):
-    """关闭串口属于用户主动中断，UI 不应该因此弹出错误框。"""
-    sender, _ = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'large.bin'
-    bin_file.write_bytes(b'H' * FRAME_SIZE * 100)
-
-    finished = MagicMock()
-    sender.send_bin(str(bin_file), None, None, finished)
-    time.sleep(0.06)
-    sender.close()
-    assert sender.wait(timeout=5)
-
-    finished.assert_called_once()
-    result, message = finished.call_args[0]
-    assert result is SendResult.STOPPED
-    assert '发送已停止' in message
-
-
-def test_close_does_not_wait_for_blocking_write(tmp_path, monkeypatch):
-    """write 阻塞在对端不接收时，close() 不能被 _port_lock 拖住（GUI 线程会卡死）。"""
-    sender, fake = make_sender(monkeypatch)
-
-    write_started = threading.Event()
-    release_write = threading.Event()
-
-    def blocking_write(data):
-        write_started.set()
-        release_write.wait(5)
-
-    monkeypatch.setattr(fake, 'write', blocking_write)
-
-    bin_file = tmp_path / 'large.bin'
-    bin_file.write_bytes(b'I' * FRAME_SIZE * 10)
-
-    sender.send_bin(str(bin_file))
-    assert write_started.wait(5)
-
-    started = time.monotonic()
-    sender.close()
-    assert time.monotonic() - started < 0.5
-
-    release_write.set()
-    assert sender.wait(timeout=5)
-
-
-def test_frame_interval_waited_between_full_frames(tmp_path, monkeypatch):
-    """每帧之间必须留出 50 ms 间隔，且最后一个不满帧后不再等待。"""
-    sender, _ = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'test.bin'
-    bin_file.write_bytes(b'J' * (FRAME_SIZE * 3 + 1))
-
-    waits = []
-
-    def fake_wait():
-        waits.append(INTERVAL_MS / 1000.0)
-        return False
-
-    monkeypatch.setattr(sender, '_wait_interval', fake_wait)
-
-    finished = MagicMock()
-    sender.send_bin(str(bin_file), None, None, finished)
-    assert sender.wait(timeout=5)
-    sender.close()
-
-    assert finished.call_args[0][0] is SendResult.COMPLETED
-    # 3 个满帧各等待一次，末尾 1 字节的不满帧不等待
-    assert waits == [0.05, 0.05, 0.05]
-
-
-def test_frame_interval_uses_configured_delay(tmp_path, monkeypatch):
-    """不打桩的计时校验，边界放宽以容忍调度抖动。"""
-    sender, _ = make_sender(monkeypatch)
-
-    bin_file = tmp_path / 'test.bin'
-    frames = 4
-    bin_file.write_bytes(b'K' * FRAME_SIZE * frames)
-
-    started = time.monotonic()
-    sender.send_bin(str(bin_file))
-    assert sender.wait(timeout=10)
-    elapsed = time.monotonic() - started
-    sender.close()
-
-    # 4 个满帧 => 4 次间隔等待
-    assert elapsed >= frames * (INTERVAL_MS / 1000.0) * 0.8
-    assert elapsed < frames * (INTERVAL_MS / 1000.0) + 2.0
-
-
-def test_stop_event_wait_uses_interval(monkeypatch):
     sender = SerialSender()
-    recorded = []
-    monkeypatch.setattr(sender._stop_event, 'wait', lambda t: recorded.append(t) or False)
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
 
-    assert sender._wait_interval() is False
-    assert recorded == [INTERVAL_MS / 1000.0]
+    assert _wait_for_written(fake, 1)
+    sender.close()
+
+    assert fake.written[4] == CMD_5A
+    assert fake.written[5] == A5_ACK_ERR
+
+
+def test_a7_returns_requested_packet(monkeypatch, tmp_path):
+    packet_size = 32
+    bin_data = bytes(range(256))  # 0x00..0xFF
+    bin_file = tmp_path / 'test.bin'
+    bin_file.write_bytes(bin_data)
+
+    # 主机先发 A5 设置 N，再发 A7 要第 2 包
+    a5_frame = pack_a5_request(packet_size)
+    a7_frame = pack_a7_request(2)
+    fake = FakeSerial(to_read=a5_frame + a7_frame)
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
+
+    on_response = MagicMock()
+    sender = SerialSender()
+    sender.set_callbacks(on_response=on_response)
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
+
+    # 等 A5 回复 + A7 回复都完成
+    assert _wait_for_written(fake, 20)
+    time.sleep(0.2)
+    sender.close()
+
+    # 找到 7A 回复的位置
+    assert CMD_7A in fake.written
+    idx_7a = fake.written.index(CMD_7A)
+    # 7A 帧：AA 55 + length(2) + cmd(1) + data(4 + 32) + crc(4)
+    response = fake.written[idx_7a - 3:idx_7a - 3 + 3 + 1 + 4 + 32 + 4]
+    # 数据段从 cmd 后开始
+    x = struct.unpack('<I', response[3 + 1:3 + 1 + 4])[0]
+    payload = response[3 + 1 + 4:3 + 1 + 4 + 32]
+    assert x == 2
+    assert payload == bin_data[64:96]
+
+
+def test_a7_without_a5_reports_error(monkeypatch, tmp_path):
+    fake = FakeSerial(to_read=pack_a7_request(0))
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
+
+    on_error = MagicMock()
+    sender = SerialSender()
+    sender.set_callbacks(on_error=on_error)
+    bin_file = tmp_path / 'test.bin'
+    bin_file.write_bytes(b'X' * 100)
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
+
+    time.sleep(0.3)
+    sender.close()
+
+    assert on_error.called
+    assert not fake.written  # 不应回复 7A
+
+
+def test_a7_out_of_range_reports_error(monkeypatch, tmp_path):
+    bin_file = tmp_path / 'test.bin'
+    bin_file.write_bytes(b'X' * 100)
+
+    a5_frame = pack_a5_request(64)
+    a7_frame = pack_a7_request(9999)
+    fake = FakeSerial(to_read=a5_frame + a7_frame)
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
+
+    on_error = MagicMock()
+    sender = SerialSender()
+    sender.set_callbacks(on_error=on_error)
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
+
+    time.sleep(0.3)
+    sender.close()
+
+    assert on_error.called

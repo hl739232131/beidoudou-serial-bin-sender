@@ -1,39 +1,57 @@
 import os
+import struct
 import threading
-from enum import Enum
-from typing import Callable, Optional
+import time
+from typing import Callable, Dict, Optional
 
 import serial
 
-from config import BAUDRATE, FRAME_SIZE, INTERVAL_MS, READ_TIMEOUT_S, WRITE_TIMEOUT_S
+from config import (
+    BAUDRATE, READ_TIMEOUT_S, WRITE_TIMEOUT_S,
+    FRAME_HEADER, HEADER_SIZE, LENGTH_SIZE, CMD_SIZE, CRC_SIZE,
+    CMD_A5, CMD_A7, A5_ACK_OK, A5_ACK_ERR,
+    MIN_PACKET_SIZE, MAX_PACKET_SIZE,
+)
 from logger import get_logger
-from protocol import pack_frame
-
-
-class SendResult(Enum):
-    """发送结束的三种状态，供 UI 区分「正常结束」「用户中断」「出错」。"""
-    COMPLETED = 'completed'
-    STOPPED = 'stopped'
-    FAILED = 'failed'
-
-    @property
-    def is_error(self) -> bool:
-        return self is SendResult.FAILED
-
-
-ProgressCallback = Callable[[int, int], None]
-LogCallback = Callable[[str], None]
-FinishedCallback = Callable[[SendResult, str], None]
+from protocol import (
+    parse_frame, pack_5a_ack, pack_7a_response,
+    parse_a5_data, parse_a7_data,
+)
 
 
 class SerialSender:
+    """
+    从机模式：监听串口，响应主机 A5 / A7 命令。
+
+    交互流程：
+      1. 主机发 A5 命令申请数据包字节数 N
+      2. 从机回复 5A（0xA5 正常 / 0x00 异常），并预先把 bin 文件分成 N 字节一包
+      3. 主机发 A7 命令申请第 x 包
+      4. 从机回复 7A，包含 x + 该包数据
+    """
+
     def __init__(self) -> None:
         self.ser: Optional[serial.Serial] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # 保护 self.ser 这个引用本身，不覆盖阻塞的 write 调用
         self._port_lock = threading.Lock()
         self._logger = get_logger(__name__)
+
+        self._buffer = b''
+        self._packet_size = 0
+        self._bin_data = b''
+        self._packets: list[bytes] = []
+        self._callbacks: Dict[str, Optional[Callable]] = {}
+
+    def set_callbacks(
+        self,
+        on_command: Optional[Callable[[str], None]] = None,
+        on_response: Optional[Callable[[str], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._callbacks['on_command'] = on_command
+        self._callbacks['on_response'] = on_response
+        self._callbacks['on_error'] = on_error
 
     def open(self, port: str, baudrate: int = BAUDRATE,
              write_timeout: float = WRITE_TIMEOUT_S) -> None:
@@ -42,159 +60,185 @@ class SerialSender:
                 port, baudrate, bytesize=8, parity='N', stopbits=1,
                 timeout=READ_TIMEOUT_S, write_timeout=write_timeout,
             )
-        self._logger.info(f'串口已打开: {port} @ {baudrate}')
-
-    def close(self) -> None:
-        self.stop()
-        with self._port_lock:
-            ser = self.ser
-            self.ser = None
-        # close() 由 GUI 线程调用，锁外执行避免与发送线程的 write 相互等待
-        if ser is not None and ser.is_open:
-            ser.close()
-            self._logger.info('串口已关闭')
-
-    def is_open(self) -> bool:
-        return self.ser is not None and self.ser.is_open
-
-    def is_sending(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def send_bin(self, file_path: str,
-                 on_progress: Optional[ProgressCallback] = None,
-                 on_log: Optional[LogCallback] = None,
-                 on_finished: Optional[FinishedCallback] = None) -> None:
-        if not self.is_open():
-            raise RuntimeError('串口未打开')
-
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f'文件不存在: {file_path}')
-
-        if self.is_sending():
-            raise RuntimeError('发送正在进行中')
-
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._send_loop,
-            args=(file_path, on_progress, on_log, on_finished),
+            target=self._listen_loop,
             daemon=True,
         )
         self._thread.start()
+        self._logger.info(f'串口已打开: {port} @ {baudrate}')
 
-    def _safe_call(self, callback, *args) -> None:
-        """回调由调用方提供，其异常不应影响发送流程的错误判定。"""
+    def close(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+
+        with self._port_lock:
+            ser = self.ser
+            self.ser = None
+        if ser is not None and ser.is_open:
+            try:
+                ser.close()
+            except Exception:
+                self._logger.debug('关闭串口时异常', exc_info=True)
+            self._logger.info('串口已关闭')
+
+    def is_open(self) -> bool:
+        ser = self.ser
+        return ser is not None and ser.is_open
+
+    def is_listening(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def load_bin(self, file_path: str) -> None:
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f'文件不存在: {file_path}')
+        with open(file_path, 'rb') as f:
+            self._bin_data = f.read()
+        self._split_packets()
+        self._logger.info(f'加载 bin 文件: {file_path} ({len(self._bin_data)} bytes)')
+
+    def _split_packets(self) -> None:
+        """根据当前 packet_size 把 bin 文件分包。"""
+        if not self._bin_data or self._packet_size <= 0:
+            self._packets = []
+            return
+
+        self._packets = []
+        for i in range(0, len(self._bin_data), self._packet_size):
+            chunk = self._bin_data[i:i + self._packet_size]
+            if len(chunk) < self._packet_size:
+                chunk += b'\xFF' * (self._packet_size - len(chunk))
+            self._packets.append(chunk)
+
+    def _listen_loop(self) -> None:
+        """后台线程：持续读取串口并处理帧。"""
+        while not self._stop_event.is_set():
+            try:
+                ser = self.ser
+                if ser is None or not ser.is_open:
+                    break
+
+                available = ser.in_waiting
+                if available > 0:
+                    data = ser.read(available)
+                    if data:
+                        self._buffer += data
+                        self._process_buffer()
+                else:
+                    time.sleep(0.01)
+            except serial.SerialException as e:
+                self._logger.exception('串口异常')
+                self._safe_callback('on_error', f'串口异常: {e}')
+                break
+            except Exception as e:
+                self._logger.exception('监听循环异常')
+                self._safe_callback('on_error', f'监听异常: {e}')
+
+    def _process_buffer(self) -> None:
+        """从缓冲区中解析完整帧并处理。"""
+        while True:
+            if self._stop_event.is_set():
+                break
+
+            idx = self._buffer.find(FRAME_HEADER)
+            if idx == -1:
+                self._buffer = b''
+                break
+
+            # 丢弃帧头之前的垃圾数据
+            self._buffer = self._buffer[idx:]
+
+            min_body = LENGTH_SIZE + CMD_SIZE + CRC_SIZE
+            if len(self._buffer) < HEADER_SIZE + min_body:
+                break
+
+            length = struct.unpack(
+                '<H', self._buffer[HEADER_SIZE:HEADER_SIZE + LENGTH_SIZE]
+            )[0]
+            expected_total = HEADER_SIZE + LENGTH_SIZE + length
+
+            if len(self._buffer) < expected_total:
+                break
+
+            frame = self._buffer[:expected_total]
+            self._buffer = self._buffer[expected_total:]
+
+            try:
+                _, cmd, data = parse_frame(frame)
+                self._handle_command(cmd, data)
+            except Exception as e:
+                self._logger.warning(f'帧解析失败: {e}')
+                self._safe_callback('on_error', f'帧解析失败: {e}')
+
+    def _handle_command(self, cmd: int, data: bytes) -> None:
+        if cmd == CMD_A5:
+            self._handle_a5(data)
+        elif cmd == CMD_A7:
+            self._handle_a7(data)
+        else:
+            self._logger.warning(f'收到未知命令: 0x{cmd:02X}')
+            self._safe_callback('on_error', f'未知命令: 0x{cmd:02X}')
+
+    def _handle_a5(self, data: bytes) -> None:
+        """处理主机申请 N 个数据的请求。"""
+        try:
+            n = parse_a5_data(data)
+        except Exception as e:
+            self._write_frame(pack_5a_ack(A5_ACK_ERR))
+            self._safe_callback('on_error', f'A5 数据解析失败: {e}')
+            return
+
+        if MIN_PACKET_SIZE <= n <= MAX_PACKET_SIZE:
+            self._packet_size = n
+            self._split_packets()
+            self._write_frame(pack_5a_ack(A5_ACK_OK))
+            self._safe_callback(
+                'on_command',
+                f'A5 申请 N={n}, 已分 {len(self._packets)} 包, 回复 5A=0x{A5_ACK_OK:02X}'
+            )
+        else:
+            self._write_frame(pack_5a_ack(A5_ACK_ERR))
+            self._safe_callback(
+                'on_command',
+                f'A5 申请 N={n}, 越界, 回复 5A=0x{A5_ACK_ERR:02X}'
+            )
+
+    def _handle_a7(self, data: bytes) -> None:
+        """处理主机申请第 x 个数据包的请求。"""
+        try:
+            x = parse_a7_data(data)
+        except Exception as e:
+            self._safe_callback('on_error', f'A7 数据解析失败: {e}')
+            return
+
+        if not self._packets:
+            self._safe_callback('on_error', 'A7 请求前未收到 A5 或 bin 未加载')
+            return
+
+        if not (0 <= x < len(self._packets)):
+            self._safe_callback('on_error', f'A7 请求序号 {x} 越界 (共 {len(self._packets)} 包)')
+            return
+
+        self._write_frame(pack_7a_response(x, self._packets[x]))
+        self._safe_callback('on_response', f'7A 发送第 {x} 包 ({len(self._packets[x])} bytes)')
+
+    def _write_frame(self, frame: bytes) -> None:
+        """线程安全地写入一帧。"""
+        ser = None
+        with self._port_lock:
+            if self.ser is not None and self.ser.is_open:
+                ser = self.ser
+        if ser is not None:
+            ser.write(frame)
+
+    def _safe_callback(self, name: str, message: str) -> None:
+        callback = self._callbacks.get(name)
         if callback is None:
             return
         try:
-            callback(*args)
+            callback(message)
         except Exception:
-            self._logger.exception('回调执行失败')
-
-    def _write_frame(self, frame: bytes) -> bool:
-        """写入一帧；若期间已请求停止或串口被关闭则返回 False。"""
-        with self._port_lock:
-            if self._stop_event.is_set():
-                return False
-            ser = self.ser
-            if ser is None or not ser.is_open:
-                raise RuntimeError('串口已关闭')
-
-        # 锁外写入：write 可能阻塞到 write_timeout，不能让 close() 一起卡住
-        try:
-            ser.write(frame)
-        except Exception:
-            # 停止/关闭与写入竞争时写入失败属于正常中断，不算错误
-            if self._stop_event.is_set():
-                return False
-            raise
-        return True
-
-    def _wait_interval(self) -> bool:
-        """帧间隔等待；返回 True 表示等待期间收到了停止请求。"""
-        return self._stop_event.wait(INTERVAL_MS / 1000.0)
-
-    def _send_loop(self, file_path: str, on_progress: Optional[ProgressCallback],
-                   on_log: Optional[LogCallback],
-                   on_finished: Optional[FinishedCallback]) -> None:
-        sent_bytes = 0
-        total_size = 0
-        result = SendResult.FAILED
-        message = ''
-        try:
-            total_size = os.path.getsize(file_path)
-            start_message = f'开始发送: {file_path} ({total_size} bytes)'
-            self._logger.info(start_message)
-            self._safe_call(on_log, start_message)
-
-            stopped = False
-            with open(file_path, 'rb') as f:
-                while not stopped:
-                    if self._stop_event.is_set():
-                        stopped = True
-                        break
-
-                    chunk = f.read(FRAME_SIZE)
-                    if not chunk:
-                        break
-
-                    if not self._write_frame(pack_frame(chunk)):
-                        stopped = True
-                        break
-
-                    sent_bytes += len(chunk)
-                    self._safe_call(on_progress, sent_bytes, total_size)
-                    self._safe_call(on_log, f'已发送 {sent_bytes}/{total_size} bytes')
-
-                    if len(chunk) == FRAME_SIZE and self._wait_interval():
-                        stopped = True
-
-            if stopped:
-                result = SendResult.STOPPED
-                message = f'发送已停止: {sent_bytes}/{total_size} bytes'
-            else:
-                result = SendResult.COMPLETED
-                message = f'发送完成: {sent_bytes}/{total_size} bytes'
-            self._logger.info(message)
-            self._safe_call(on_log, message)
-        except serial.SerialTimeoutException as e:
-            result = SendResult.FAILED
-            message = f'发送超时: {e}'
-            self._logger.exception(f'发送超时，已发送 {sent_bytes}/{total_size} bytes')
-            self._safe_call(on_log, message)
-        except Exception as e:
-            result = SendResult.FAILED
-            message = f'发送失败: {e}'
-            self._logger.exception(f'发送异常，已发送 {sent_bytes}/{total_size} bytes')
-            self._safe_call(on_log, message)
-        finally:
-            self._safe_call(on_finished, result, message)
-
-    def _cancel_pending_write(self) -> None:
-        """Win32 上取消阻塞中的 write，让发送线程尽快退出。"""
-        ser = self.ser
-        cancel_write = getattr(ser, 'cancel_write', None)
-        if cancel_write is None:
-            return
-        try:
-            cancel_write()
-        except Exception:
-            self._logger.debug('取消未完成的写入失败', exc_info=True)
-
-    def stop(self) -> None:
-        """请求停止发送，立即返回；发送线程会通过 on_finished 上报结果。"""
-        if self.is_sending():
-            self._logger.info('已请求停止发送')
-        self._stop_event.set()
-        self._cancel_pending_write()
-
-    def wait(self, timeout: Optional[float] = None) -> bool:
-        """等待发送线程结束；仅在确实结束后才释放线程句柄。"""
-        thread = self._thread
-        if thread is None:
-            return True
-        thread.join(timeout)
-        if thread.is_alive():
-            return False
-        if self._thread is thread:
-            self._thread = None
-        return True
+            self._logger.exception(f'{name} 回调执行失败')
