@@ -74,7 +74,15 @@ python -m pytest tests/ -v
 
 ## 打包成 exe
 
-需在 **Windows** 环境下执行（PyInstaller 在目标平台上打包）：
+需在 **Windows** 环境下执行（PyInstaller 在目标平台上打包）。
+
+先安装依赖（含 PyInstaller）：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+再打包：
 
 ```bash
 python build.py

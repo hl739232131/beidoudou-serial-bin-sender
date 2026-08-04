@@ -1,6 +1,18 @@
+import importlib.util
 import os
 import subprocess
 import sys
+
+
+def ensure_pyinstaller() -> None:
+    if importlib.util.find_spec('PyInstaller') is not None:
+        return
+    print('错误: 当前 Python 环境未安装 PyInstaller。')
+    print(f'      解释器: {sys.executable}')
+    print('请先安装依赖后再打包，任选其一：')
+    print(f'  {sys.executable} -m pip install -r requirements.txt')
+    print(f'  {sys.executable} -m pip install "pyinstaller>=6.0.0"')
+    sys.exit(1)
 
 
 def main():
@@ -8,6 +20,8 @@ def main():
     icon_ico = os.path.join(project_dir, 'assets', 'app-icon.ico')
     icon_png = os.path.join(project_dir, 'assets', 'app-icon.png')
     data_sep = ';' if sys.platform == 'win32' else ':'
+
+    ensure_pyinstaller()
 
     if sys.platform != 'win32':
         print('警告: PyInstaller 不支持交叉编译，当前平台不是 Windows。')
