@@ -5,6 +5,9 @@ import sys
 
 def main():
     project_dir = os.path.dirname(os.path.abspath(__file__))
+    icon_ico = os.path.join(project_dir, 'assets', 'app-icon.ico')
+    icon_png = os.path.join(project_dir, 'assets', 'app-icon.png')
+    data_sep = ';' if sys.platform == 'win32' else ':'
 
     if sys.platform != 'win32':
         print('警告: PyInstaller 不支持交叉编译，当前平台不是 Windows。')
@@ -17,6 +20,10 @@ def main():
         '--name', 'SerialBinSender',
         '--noconfirm',
         '--clean',
+        '--icon', icon_ico,
+        # 运行时窗口图标（源码与打包后均可加载）
+        '--add-data', f'{icon_png}{data_sep}assets',
+        '--add-data', f'{icon_ico}{data_sep}assets',
         # PyQt6 子模块：显式收集，避免 Windows 打包后运行时找不到模块
         '--hidden-import', 'PyQt6',
         '--hidden-import', 'PyQt6.sip',
