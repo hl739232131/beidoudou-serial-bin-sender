@@ -5,9 +5,10 @@ import time
 import serial
 from unittest.mock import MagicMock
 import pytest
+import binascii
 from serial_sender import SerialSender
-from protocol import pack_a5_request, pack_a7_request
-from config import CMD_5A, CMD_7A, A5_ACK_OK, A5_ACK_ERR, MAX_PACKET_SIZE
+from protocol import pack_a5_request, pack_a6_request, pack_a7_request, parse_frame, parse_6a_data
+from config import CMD_5A, CMD_6A, CMD_7A, A5_ACK_OK, A5_ACK_ERR, MAX_PACKET_SIZE
 
 
 class FakeSerial:
@@ -97,6 +98,72 @@ def test_a5_invalid_replies_zero(monkeypatch, tmp_path):
 
     assert fake.written[4] == CMD_5A
     assert fake.written[5] == A5_ACK_ERR
+
+
+def test_a6_returns_file_info(monkeypatch, tmp_path):
+    packet_size = 64
+    bin_data = b'ABCDEFGH' * 30  # 240 bytes -> 4 packets
+    bin_file = tmp_path / 'test.bin'
+    bin_file.write_bytes(bin_data)
+
+    a5_frame = pack_a5_request(packet_size)
+    a6_frame = pack_a6_request()
+    fake = FakeSerial(to_read=a5_frame + a6_frame)
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
+
+    sender = SerialSender()
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
+
+    assert _wait_for_written(fake, 20)
+    time.sleep(0.2)
+    sender.close()
+
+    # 依次解析回复帧，找到 6A（避免 CRC 字节中的 0x6A 被误匹配）
+    buf = fake.written
+    found = None
+    while buf:
+        idx = buf.find(b'\xAA\x55')
+        if idx < 0:
+            break
+        buf = buf[idx:]
+        if len(buf) < 5:
+            break
+        length = struct.unpack('<H', buf[2:4])[0]
+        total = 2 + 2 + length
+        if len(buf) < total:
+            break
+        frame = buf[:total]
+        buf = buf[total:]
+        _, cmd, data = parse_frame(frame)
+        if cmd == CMD_6A:
+            found = data
+            break
+
+    assert found is not None, f'未找到 6A 回复: {fake.written.hex()}'
+    file_size, packet_count, file_crc = parse_6a_data(found)
+    assert file_size == len(bin_data)
+    assert packet_count == 4
+    assert file_crc == (binascii.crc32(bin_data) & 0xFFFFFFFF)
+
+
+def test_a6_without_a5_reports_error(monkeypatch, tmp_path):
+    fake = FakeSerial(to_read=pack_a6_request())
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
+
+    on_error = MagicMock()
+    sender = SerialSender()
+    sender.set_callbacks(on_error=on_error)
+    bin_file = tmp_path / 'test.bin'
+    bin_file.write_bytes(b'X' * 100)
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
+
+    time.sleep(0.3)
+    sender.close()
+
+    assert on_error.called
+    assert CMD_6A not in fake.written
 
 
 def test_a7_returns_requested_packet(monkeypatch, tmp_path):

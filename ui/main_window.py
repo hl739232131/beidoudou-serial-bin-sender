@@ -135,7 +135,7 @@ class MainWindow(QWidget):
                 self._sender.open(port, baud)
                 self.open_btn.setText('关闭串口')
                 self.log(f'串口已打开: {port} @ {baud}')
-                self.log('已进入从机监听模式，等待主机发送 A5 命令')
+                self.log('已进入从机监听模式，等待主机发送 A5 / A6 / A7 命令')
             except Exception as e:
                 self.log(f'打开串口失败: {e}', logging.ERROR, exc_info=True)
                 QMessageBox.critical(self, '错误', f'打开串口失败: {e}')
