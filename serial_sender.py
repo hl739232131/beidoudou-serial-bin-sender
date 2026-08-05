@@ -50,10 +50,17 @@ class SerialSender:
         on_command: Optional[Callable[[str], None]] = None,
         on_response: Optional[Callable[[str], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
+        on_progress: Optional[Callable[[Optional[int], int, int], None]] = None,
     ) -> None:
+        """
+        on_progress(current_x, total_packets, packet_size)：
+          - A5 成功后 current_x=None，用于重置进度
+          - A7 成功后 current_x 为已发送包序号（从 0 起）
+        """
         self._callbacks['on_command'] = on_command
         self._callbacks['on_response'] = on_response
         self._callbacks['on_error'] = on_error
+        self._callbacks['on_progress'] = on_progress
 
     def open(self, port: str, baudrate: int = BAUDRATE,
              write_timeout: float = WRITE_TIMEOUT_S) -> None:
@@ -203,6 +210,7 @@ class SerialSender:
                 'on_command',
                 f'A5 申请 N={n}, 已分 {len(self._packets)} 包, 回复 5A=0x{A5_ACK_OK:02X}'
             )
+            self._emit_progress(None)
         else:
             self._write_frame(pack_5a_ack(A5_ACK_ERR))
             self._safe_callback(
@@ -253,6 +261,16 @@ class SerialSender:
 
         self._write_frame(pack_7a_response(x, self._packets[x]))
         self._safe_callback('on_response', f'7A 发送第 {x} 包 ({len(self._packets[x])} bytes)')
+        self._emit_progress(x)
+
+    def _emit_progress(self, current_x: Optional[int]) -> None:
+        callback = self._callbacks.get('on_progress')
+        if callback is None:
+            return
+        try:
+            callback(current_x, len(self._packets), self._packet_size)
+        except Exception:
+            self._logger.exception('on_progress 回调执行失败')
 
     def _write_frame(self, frame: bytes) -> None:
         """线程安全地写入一帧。"""

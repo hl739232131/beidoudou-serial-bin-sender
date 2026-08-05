@@ -166,6 +166,31 @@ def test_a6_without_a5_reports_error(monkeypatch, tmp_path):
     assert CMD_6A not in fake.written
 
 
+def test_a5_and_a7_emit_progress(monkeypatch, tmp_path):
+    packet_size = 32
+    bin_data = bytes(range(96))  # 3 packets
+    bin_file = tmp_path / 'test.bin'
+    bin_file.write_bytes(bin_data)
+
+    a5_frame = pack_a5_request(packet_size)
+    a7_frame = pack_a7_request(1)
+    fake = FakeSerial(to_read=a5_frame + a7_frame)
+    monkeypatch.setattr(serial, 'Serial', lambda *args, **kwargs: fake)
+
+    progress_calls = []
+    sender = SerialSender()
+    sender.set_callbacks(on_progress=lambda cur, total, n: progress_calls.append((cur, total, n)))
+    sender.load_bin(str(bin_file))
+    sender.open('COM1')
+
+    assert _wait_for_written(fake, 20)
+    time.sleep(0.2)
+    sender.close()
+
+    assert (None, 3, packet_size) in progress_calls
+    assert (1, 3, packet_size) in progress_calls
+
+
 def test_a7_returns_requested_packet(monkeypatch, tmp_path):
     packet_size = 32
     bin_data = bytes(range(256))  # 0x00..0xFF

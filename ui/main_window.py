@@ -14,6 +14,8 @@ from logger import get_logger, get_log_file_path
 
 class MainWindow(QWidget):
     log_signal = pyqtSignal(str)
+    # current_x 用 -1 表示 A5 重置（尚无发送包）
+    progress_signal = pyqtSignal(int, int, int)
 
     def __init__(self):
         super().__init__()
@@ -24,10 +26,12 @@ class MainWindow(QWidget):
         self.bin_path = ''
 
         self.log_signal.connect(self.append_log)
+        self.progress_signal.connect(self._update_progress_ui)
         self._sender.set_callbacks(
             on_command=lambda msg: self.log_signal.emit(f'[主机命令] {msg}'),
             on_response=lambda msg: self.log_signal.emit(f'[从机回复] {msg}'),
             on_error=lambda msg: self.log_signal.emit(f'[错误] {msg}'),
+            on_progress=self._on_progress,
         )
 
         self._init_ui()
@@ -92,6 +96,7 @@ class MainWindow(QWidget):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setFormat('%v / %m')
         file_layout.addWidget(self.progress, 3, 0, 1, 4)
 
         layout.addWidget(file_group)
@@ -153,11 +158,33 @@ class MainWindow(QWidget):
             self.packet_size_label.setText('等待 A5 设置 N')
             self.packet_count_label.setText('等待 A5 设置 N')
             self.current_packet_label.setText('等待主机请求')
+            self.progress.setRange(0, 100)
             self.progress.setValue(0)
             self.log(f'已加载 bin 文件: {path} ({size} bytes)')
         except Exception as e:
             self.log(f'加载 bin 文件失败: {e}', logging.ERROR, exc_info=True)
             QMessageBox.critical(self, '错误', f'加载 bin 文件失败: {e}')
+
+    def _on_progress(self, current_x, total_packets: int, packet_size: int) -> None:
+        # 串口监听线程回调，转到主线程更新 UI
+        x = -1 if current_x is None else int(current_x)
+        self.progress_signal.emit(x, int(total_packets), int(packet_size))
+
+    def _update_progress_ui(self, current_x: int, total_packets: int, packet_size: int) -> None:
+        self.packet_size_label.setText(str(packet_size))
+        self.packet_count_label.setText(str(total_packets))
+
+        maximum = max(total_packets, 1)
+        self.progress.setMaximum(maximum)
+
+        if current_x < 0:
+            self.current_packet_label.setText('等待主机请求')
+            self.progress.setValue(0)
+            return
+
+        self.current_packet_label.setText(f'第 {current_x} / {total_packets - 1} 包')
+        # 已发送到第 current_x 包（含），进度为 current_x + 1
+        self.progress.setValue(min(current_x + 1, maximum))
 
     def append_log(self, msg):
         self.log_box.append(msg)
