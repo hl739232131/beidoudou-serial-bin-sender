@@ -9,25 +9,27 @@ import serial
 from config import (
     BAUDRATE, READ_TIMEOUT_S, WRITE_TIMEOUT_S,
     FRAME_HEADER, HEADER_SIZE, LENGTH_SIZE, CMD_SIZE, CRC_SIZE,
-    CMD_A5, CMD_A7, A5_ACK_OK, A5_ACK_ERR,
+    CMD_A5, CMD_A6, CMD_A7, A5_ACK_OK, A5_ACK_ERR,
     MIN_PACKET_SIZE, MAX_PACKET_SIZE,
 )
 from logger import get_logger
 from protocol import (
-    parse_frame, pack_5a_ack, pack_7a_response,
-    parse_a5_data, parse_a7_data,
+    parse_frame, pack_5a_ack, pack_6a_response, pack_7a_response,
+    parse_a5_data, parse_a6_data, parse_a7_data, calc_crc,
 )
 
 
 class SerialSender:
     """
-    从机模式：监听串口，响应主机 A5 / A7 命令。
+    从机模式：监听串口，响应主机 A5 / A6 / A7 命令。
 
     交互流程：
       1. 主机发 A5 命令申请数据包字节数 N
       2. 从机回复 5A（0xA5 正常 / 0x00 异常），并预先把 bin 文件分成 N 字节一包
-      3. 主机发 A7 命令申请第 x 包
-      4. 从机回复 7A，包含 x + 该包数据
+      3. 主机发 A6 命令申请文件信息
+      4. 从机回复 6A：文件长度 + 总包数 + CRC32（针对原始 bin）
+      5. 主机发 A7 命令申请第 x 包
+      6. 从机回复 7A，包含 x + 该包数据
     """
 
     def __init__(self) -> None:
@@ -176,6 +178,8 @@ class SerialSender:
     def _handle_command(self, cmd: int, data: bytes) -> None:
         if cmd == CMD_A5:
             self._handle_a5(data)
+        elif cmd == CMD_A6:
+            self._handle_a6(data)
         elif cmd == CMD_A7:
             self._handle_a7(data)
         else:
@@ -205,6 +209,31 @@ class SerialSender:
                 'on_command',
                 f'A5 申请 N={n}, 越界, 回复 5A=0x{A5_ACK_ERR:02X}'
             )
+
+    def _handle_a6(self, data: bytes) -> None:
+        """处理主机申请 bin 文件信息的请求。"""
+        try:
+            parse_a6_data(data)
+        except Exception as e:
+            self._safe_callback('on_error', f'A6 数据解析失败: {e}')
+            return
+
+        if not self._bin_data:
+            self._safe_callback('on_error', 'A6 请求前 bin 未加载')
+            return
+
+        if self._packet_size <= 0 or not self._packets:
+            self._safe_callback('on_error', 'A6 请求前未收到有效 A5，无法确定总包数')
+            return
+
+        file_size = len(self._bin_data)
+        packet_count = len(self._packets)
+        file_crc = calc_crc(self._bin_data)
+        self._write_frame(pack_6a_response(file_size, packet_count, file_crc))
+        self._safe_callback(
+            'on_response',
+            f'6A 回复: 文件长度={file_size}, 总包数={packet_count}, CRC32=0x{file_crc:08X}'
+        )
 
     def _handle_a7(self, data: bytes) -> None:
         """处理主机申请第 x 个数据包的请求。"""

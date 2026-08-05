@@ -20,8 +20,13 @@ WRITE_TIMEOUT_S = 2.0
 # 主机命令
 CMD_A5 = 0xA5  # 主机申请下发字节数 N
 CMD_5A = 0x5A  # 从机回复收到
+CMD_A6 = 0xA6  # 主机申请 bin 文件信息（长度/总包数/CRC32）
+CMD_6A = 0x6A  # 从机回复 bin 文件信息
 CMD_A7 = 0xA7  # 主机申请第 x 个 bin 数据包
 CMD_7A = 0x7A  # 从机发送第 x 个 bin 数据包
+
+# 6A 数据段：文件长度(4) + 总包数(4) + CRC32(4)
+A6_INFO_SIZE = 12
 
 # 5A 回复状态
 A5_ACK_OK = 0xA5   # N 正常，已收到

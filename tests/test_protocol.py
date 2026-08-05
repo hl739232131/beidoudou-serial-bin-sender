@@ -3,11 +3,12 @@ import binascii
 import pytest
 from protocol import (
     calc_crc, pack_frame, parse_frame,
-    pack_a5_request, pack_5a_ack, pack_a7_request, pack_7a_response,
-    parse_a5_data, parse_a7_data, parse_7a_data,
+    pack_a5_request, pack_5a_ack, pack_a6_request, pack_6a_response,
+    pack_a7_request, pack_7a_response,
+    parse_a5_data, parse_a6_data, parse_6a_data, parse_a7_data, parse_7a_data,
 )
 from config import FRAME_HEADER, HEADER_SIZE, LENGTH_SIZE, CMD_SIZE, CRC_SIZE
-from config import CMD_A5, CMD_5A, CMD_A7, CMD_7A, A5_ACK_OK
+from config import CMD_A5, CMD_5A, CMD_A6, CMD_6A, CMD_A7, CMD_7A, A5_ACK_OK, A6_INFO_SIZE
 
 
 def test_calc_crc_matches_binascii():
@@ -66,6 +67,24 @@ def test_5a_ack_roundtrip():
     _, cmd, data = parse_frame(frame)
     assert cmd == CMD_5A
     assert data == bytes([A5_ACK_OK])
+
+
+def test_a6_request_roundtrip():
+    frame = pack_a6_request()
+    _, cmd, data = parse_frame(frame)
+    assert cmd == CMD_A6
+    parse_a6_data(data)
+
+
+def test_6a_response_roundtrip():
+    frame = pack_6a_response(120456, 236, 0xABCD1234)
+    _, cmd, data = parse_frame(frame)
+    assert cmd == CMD_6A
+    assert len(data) == A6_INFO_SIZE
+    file_size, packet_count, file_crc = parse_6a_data(data)
+    assert file_size == 120456
+    assert packet_count == 236
+    assert file_crc == 0xABCD1234
 
 
 def test_a7_request_roundtrip():

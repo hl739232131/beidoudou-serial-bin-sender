@@ -3,7 +3,7 @@ import struct
 from typing import Tuple
 from config import (
     FRAME_HEADER, HEADER_SIZE, LENGTH_SIZE, CMD_SIZE, CRC_SIZE,
-    CMD_A5, CMD_5A, CMD_A7, CMD_7A,
+    CMD_A5, CMD_5A, CMD_A6, CMD_6A, CMD_A7, CMD_7A, A6_INFO_SIZE,
 )
 
 
@@ -81,6 +81,23 @@ def pack_5a_ack(status: int) -> bytes:
     return pack_frame(CMD_SIZE + 1 + CRC_SIZE, CMD_5A, bytes([status]))
 
 
+def pack_a6_request() -> bytes:
+    """主机发送：申请 bin 文件信息（无数据段）。"""
+    return pack_frame(CMD_SIZE + CRC_SIZE, CMD_A6, b'')
+
+
+def pack_6a_response(file_size: int, packet_count: int, file_crc: int) -> bytes:
+    """
+    从机回复：文件长度(4B LE) + 总包数(4B LE) + CRC32(4B LE)。
+
+    CRC32 针对原始 bin 文件内容计算，不包含本字段本身。
+    """
+    data = struct.pack('<III', file_size, packet_count, file_crc & 0xFFFFFFFF)
+    if len(data) != A6_INFO_SIZE:
+        raise ValueError(f'6A 数据长度应为 {A6_INFO_SIZE}, 实际 {len(data)}')
+    return pack_frame(CMD_SIZE + A6_INFO_SIZE + CRC_SIZE, CMD_6A, data)
+
+
 def pack_a7_request(x: int) -> bytes:
     """主机发送：申请第 x 个数据包（4 字节小端序）。"""
     return pack_frame(CMD_SIZE + 4 + CRC_SIZE, CMD_A7, struct.pack('<I', x))
@@ -96,6 +113,19 @@ def parse_a5_data(data: bytes) -> int:
     if len(data) != 2:
         raise ValueError(f'A5 数据长度应为 2, 实际 {len(data)}')
     return struct.unpack('<H', data)[0]
+
+
+def parse_a6_data(data: bytes) -> None:
+    """解析 A6 命令数据（应为空）。"""
+    if len(data) != 0:
+        raise ValueError(f'A6 数据长度应为 0, 实际 {len(data)}')
+
+
+def parse_6a_data(data: bytes) -> Tuple[int, int, int]:
+    """解析 6A 命令数据，返回 (file_size, packet_count, file_crc)。"""
+    if len(data) != A6_INFO_SIZE:
+        raise ValueError(f'6A 数据长度应为 {A6_INFO_SIZE}, 实际 {len(data)}')
+    return struct.unpack('<III', data)
 
 
 def parse_a7_data(data: bytes) -> int:
